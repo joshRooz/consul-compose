@@ -1,0 +1,260 @@
+# Interpolation does not appear to be supported on top level name. 
+# Would like to use ${CONSUL_DATACENTER:-dc1}, but will pass -p flag 
+# instead as workaround.
+name: dc1
+
+services:
+  consul-server:
+    image: ${CONSUL_IMAGE}:${CONSUL_VERSION}
+    deploy:
+      replicas: 3
+    command: 
+      - "agent"
+      - "-config-dir=/consul/config"
+      - "-bootstrap-expect=3"
+      - "-datacenter=${COMPOSE_PROJECT_NAME}"
+      - "-retry-join=${COMPOSE_PROJECT_NAME}-consul-server-1"
+      - "-retry-join=${COMPOSE_PROJECT_NAME}-consul-server-2"
+      - "-retry-join=${COMPOSE_PROJECT_NAME}-consul-server-3"
+      - "-retry-join-wan=consul-server-wan"
+    restart: unless-stopped
+    environment:
+      CONSUL_LICENSE_PATH: /consul/license/consul.hclic
+      #CONSUL_HTTP_ADDR: "https://localhost:8501"
+    configs:
+      - source: server_config
+        target: /consul/config/server.hcl
+    secrets:
+      - source: enterprise_license
+        target: /consul/license/consul.hclic
+      - source: ca_cert
+        target: /consul/tls/consul-agent-ca.pem
+    networks:
+      lan_serf:
+      wan_serf:
+        aliases:
+          - consul-server-wan
+    ports:
+      - "8500/tcp"  #TODO remove & update hcl
+      - "8501/tcp"
+
+
+#  consul-gateway:
+#    image: ${CONSUL_IMAGE}:${CONSUL_VERSION}
+#    configs:
+#      - mesh_gateway_config
+#      - ingress_gateway_config
+#      - terminating_gateway_config
+#    depends_on:
+#      - consul-server
+
+
+  # General NOTE: DNS -
+  # For application services we are relying on Docker's embedded DNS server to join the consul cluster.
+  # The embedded DNS server leverages consul as a recursor, along with google for anything external.
+
+  # Food for thought - I don't think compose has the capability to scale multiple services 
+  # together.. nor is it probably intended to.
+  counting:
+    image: hashicorp/counting-service:0.0.2 # NOTE image tagged as linux/amd64 but will work on arm64
+    restart: unless-stopped
+    environment:
+      PORT: 9001
+    networks:
+      - lan_serf
+    dns: 127.0.0.1
+
+  consul-client-counting:
+    image: ${CONSUL_IMAGE}:${CONSUL_VERSION}
+    command: "agent -config-dir=/consul/config -datacenter ${COMPOSE_PROJECT_NAME} -retry-join=${COMPOSE_PROJECT_NAME}-consul-server-1"
+    restart: unless-stopped
+    environment:
+      CONSUL_LICENSE_PATH: /consul/license/consul.hclic
+    configs:
+      - source: client_config
+        target: /consul/config/client.hcl
+      - source: counting_config
+        target: /consul/config/counting.hcl
+    secrets:
+      - source: enterprise_license
+        target: /consul/license/consul.hclic
+    network_mode: "service:counting"
+    depends_on:
+      - consul-server
+
+  consul-copy-bin-counting:
+    image: ${CONSUL_IMAGE}:${CONSUL_VERSION}
+    command:
+      - "/bin/sh"
+      - "-ec"
+      - "cp /bin/consul /consul/connect-inject/consul"
+    volumes:
+      - consul_bin_counting:/consul/connect-inject:rw
+    network_mode: none
+
+  envoyproxy-counting:
+    image: ${ENVOY_IMAGE}:${ENVOY_VERSION}
+    command:
+      - "/consul/connect-inject/consul"
+      - "connect"
+      - "envoy"
+      - "-sidecar-for"
+      - "counting"
+    restart: unless-stopped
+    volumes:
+      - consul_bin_counting:/consul/connect-inject:ro
+    network_mode: "service:counting"
+    depends_on:
+      - consul-copy-bin-counting
+
+  consul-update-dns-counting:
+    image: nicolaka/netshoot:v0.7
+    privileged: true
+    command:
+      - "/bin/sh"
+      - "-c"
+      - "iptables -t nat -A OUTPUT -d localhost -p udp -m udp --dport 53 -j REDIRECT --to-ports 8600 && \
+          iptables -t nat -A OUTPUT -d localhost -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 8600" # && \
+      #   while true ; do sleep 1800 ; done"
+    network_mode: "service:counting"
+    depends_on:
+      - consul-client-counting
+
+  #netshoot-counting:
+  #  image: nicolaka/netshoot:v0.7
+  #  command:
+  #    - "/bin/sh"
+  #    - "-c"
+  #    - "while true ; do sleep 86400; done"
+  #  restart: unless-stopped
+  #  privileged: true
+  #  network_mode: "service:counting"
+
+
+  # -- DASHBOARD SERVICE --
+  dashboard:
+    image: hashicorp/dashboard-service:0.0.4 # NOTE image tagged as linux/amd64 but will work on arm64
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+      #COUNTING_SERVICE_URL: 'http://counting.service.consul:9001' #TODO force over the mesh
+      COUNTING_SERVICE_URL: 'http://127.0.0.1:9001'
+    networks:
+      - lan_serf
+    dns: 127.0.0.1
+    ports:
+      - "8000/tcp" # dashboard service
+
+  consul-client-dashboard:
+    image: ${CONSUL_IMAGE}:${CONSUL_VERSION}
+    command: "agent -config-dir=/consul/config -datacenter ${COMPOSE_PROJECT_NAME} -retry-join=${COMPOSE_PROJECT_NAME}-consul-server-1"
+    restart: unless-stopped
+    environment:
+      CONSUL_LICENSE_PATH: /consul/license/consul.hclic
+    configs:
+      - source: client_config
+        target: /consul/config/client.hcl
+      - source: dashboard_config
+        target: /consul/config/dashboard.hcl
+    secrets:
+      - source: enterprise_license
+        target: /consul/license/consul.hclic
+    network_mode: "service:dashboard"
+    depends_on:
+      - consul-server
+
+  consul-copy-bin-dashboard:
+    image: ${CONSUL_IMAGE}:${CONSUL_VERSION}
+    command:
+      - "/bin/sh"
+      - "-ec"
+      - "cp /bin/consul /consul/connect-inject/consul"
+    volumes:
+      - consul_bin_counting:/consul/connect-inject:rw
+    network_mode: none
+
+  consul-update-dns-dashboard:
+    image: nicolaka/netshoot:v0.7
+    privileged: true
+    command:
+      - "/bin/sh"
+      - "-c"
+      - "iptables -t nat -A OUTPUT -d localhost -p udp -m udp --dport 53 -j REDIRECT --to-ports 8600 && \
+          iptables -t nat -A OUTPUT -d localhost -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 8600" # && \
+      #   while true ; do sleep 1800 ; done"
+    network_mode: "service:dashboard"
+    depends_on:
+      - consul-client-dashboard
+
+  envoyproxy-dashboard:
+    image: ${ENVOY_IMAGE}:${ENVOY_VERSION}
+    command:
+      - "/consul/connect-inject/consul"
+      - "connect"
+      - "envoy"
+      - "-sidecar-for"
+      - "dashboard"
+    restart: unless-stopped
+    volumes:
+      - consul_bin_counting:/consul/connect-inject:ro
+    network_mode: "service:dashboard"
+    depends_on:
+      - consul-copy-bin-dashboard
+
+  #netshoot-dashboard:
+  #  image: nicolaka/netshoot:v0.7
+  #  command:
+  #    - "/bin/sh"
+  #    - "-c"
+  #    - "while true ; do sleep 86400; done"
+  #  restart: unless-stopped
+  #  privileged: true
+  #  network_mode: "service:dashboard"
+
+
+networks:
+  lan_serf:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: 'true'
+      com.docker.network.driver.mtu: 1500
+  wan_serf:
+    # override default compose naming scheme so we have a single 'wan_serf'
+    # routable network across all consul datacenters
+    name: wan_serf
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: 'true'
+      com.docker.network.driver.mtu: 1500
+    ipam:
+      config:
+        - subnet: ${WAN_SERF:-10.100.0.0/16}
+
+
+volumes:
+  consul_bin_counting:
+    driver: local
+  consul_bin_dashboard:
+    driver: local
+
+configs:
+  client_config:
+    file: "./hcl/client.hcl"
+  server_config:
+    file: "./hcl/server.hcl"
+#  mesh_gateway_config:
+#    file: #TODO
+#  ingress_gateway_config:
+#    file: #TODO
+#  terminating_gateway_config:
+#    file: #TODO
+  counting_config:
+    file: "./hcl/counting-service.hcl"
+  dashboard_config:
+    file: "./hcl/dashboard-service.hcl"
+
+secrets:
+  enterprise_license:
+    file: ${CONSUL_LICENSE_PATH:-/dev/null}
+  ca_cert:
+    file: ${CONSUL_CACERT:-./secrets/consul-agent-ca.pem}
